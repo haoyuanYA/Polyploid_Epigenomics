@@ -1,0 +1,83 @@
+# ----------------------------- #
+#   User-defined parameters     #
+# ----------------------------- #
+GENOME="/lustre4/gulab/dhy/1.genome/finall_o_gap_genome/baicai"
+GTF="${GENOME}.gtf"                         # Gene annotation in GTF format
+INPUT_FILE="/lustre/gulab/dhy/2.polyploid_RNA-seq/sample.txt"  # Two-column: R1 R2
+THREADS=8                                   # Number of threads
+OUTPUT_DIR="./results"
+mkdir -p "${OUTPUT_DIR}"
+
+# ----------------------------- #
+#   Function: Process one sample #
+# ----------------------------- #
+process_sample() {
+    SAMPLE_R1=$1
+    SAMPLE_R2=$2
+    BASENAME=$(basename "${SAMPLE_R1}" .fq.gz)
+
+    echo ">>> Processing sample: ${BASENAME}"
+
+    # Step 1. Quality control and adapter trimming with fastp
+    fastp \
+        -i "${SAMPLE_R1}" -I "${SAMPLE_R2}" \
+        -o "${OUTPUT_DIR}/${BASENAME}_R1.trimmed.fq.gz" \
+        -O "${OUTPUT_DIR}/${BASENAME}_R2.trimmed.fq.gz" \
+        -h "${OUTPUT_DIR}/${BASENAME}_fastp.html" \
+        -w "${THREADS}"
+
+    # Step 2. Alignment with HISAT2
+    hisat2 \
+        -t -p "${THREADS}" --min-intronlen 20 --max-intronlen 20000 --dta \
+        -x "${GENOME}.index" \
+        -1 "${OUTPUT_DIR}/${BASENAME}_R1.trimmed.fq.gz" \
+        -2 "${OUTPUT_DIR}/${BASENAME}_R2.trimmed.fq.gz" \
+        -S "${OUTPUT_DIR}/${BASENAME}.sam" \
+        --summary-file "${OUTPUT_DIR}/${BASENAME}_alignment.summary" \
+        --very-sensitive
+
+    # Step 3. Convert SAM to sorted BAM
+    samtools sort -@ "${THREADS}" \
+        -o "${OUTPUT_DIR}/${BASENAME}.sorted.bam" \
+        "${OUTPUT_DIR}/${BASENAME}.sam"
+    samtools index "${OUTPUT_DIR}/${BASENAME}.sorted.bam"
+    rm "${OUTPUT_DIR}/${BASENAME}.sam"
+
+    # Step 4. Transcript assembly and quantification with StringTie
+    stringtie -e -B -p "${THREADS}" -f 0.1 \
+        -G "${GTF}" \
+        -o "${OUTPUT_DIR}/${BASENAME}.gtf" \
+        "${OUTPUT_DIR}/${BASENAME}.sorted.bam" \
+        -A "${OUTPUT_DIR}/${BASENAME}_abundance.txt"
+
+    # Step 5. Sort abundance file for downstream analysis
+    sort -k1 "${OUTPUT_DIR}/${BASENAME}_abundance.txt" \
+        > "${OUTPUT_DIR}/${BASENAME}_abundance.sorted.txt"
+
+    echo ">>> Finished sample: ${BASENAME}"
+}
+
+# ----------------------------- #
+#   Main loop over all samples  #
+# ----------------------------- #
+while read -r SAMPLE_R1 SAMPLE_R2; do
+    process_sample "${SAMPLE_R1}" "${SAMPLE_R2}" &
+    # Restrict number of parallel jobs
+    while (( $(jobs -r | wc -l) >= 2 )); do
+        sleep 10
+    done
+done < "${INPUT_FILE}"
+
+wait
+
+# ----------------------------- #
+#   Final Step: Gene-level counts
+# ----------------------------- #
+featureCounts \
+    -a "${GTF}" \
+    -o "${OUTPUT_DIR}/all_samples.featureCounts.txt" \
+    -t exon -g gene_id -T "${THREADS}" \
+    "${OUTPUT_DIR}"/*.sorted.bam
+
+echo ">>> RNA-seq processing pipeline complete."
+echo ">>
