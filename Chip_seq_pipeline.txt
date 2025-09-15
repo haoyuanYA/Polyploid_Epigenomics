@@ -1,0 +1,81 @@
+# 1. Set directories and genome files
+# =========================================
+WORKDIR="/lustre4/gulab/dhy/baicai"
+GENOME_DIR="/lustre4/gulab/dhy/1.genome/tra_genome/T_851"
+GENOME_FA="$GENOME_DIR.fa"
+GENOME_SIZES="$WORKDIR/genome/baicai.sizes"
+GTF_FILE="$WORKDIR/genome/baicai.gtf"
+PICARD="/lustre4/gulab/dhy/3.software/picard.jar"
+BIGWIG_SCRIPT="/opt/scripts/file_to_bigwig_pe.py"
+THREADS=16
+GENOME_SIZE_GB="4.23e8"
+cd $WORKDIR
+# =========================================
+# 2. Prepare genome index for Bowtie2 and Bismark
+# =========================================
+bowtie2-build -f $GENOME_FA ${GENOME_DIR}.index
+bismark_genome_preparation --parallel $THREADS $GENOME_DIR
+# =========================================
+# 3. ATAC-seq: QC, mapping, BAM processing, BED and BigWig generation, peak calling
+# =========================================
+cat list | while read line; do
+    ID1=$(echo $line | awk '{print $1}')
+    ID2=$(echo $line | awk '{print $2}')
+    # Quality control with fastp
+    fastp -i $ID1 -I $ID2 \
+        -o ${ID1%.fq.gz}.fastp.gz -O ${ID2%.fq.gz}.fastp.gz \
+        -h ${ID1%.fq.gz}.fastp.html
+    # Mapping with Bowtie2
+    bowtie2 -x ${GENOME_DIR}.index -p 10 -X 1000 --very-sensitive \
+        -1 ${ID1%.fq.gz}.fastp.gz -2 ${ID2%.fq.gz}.fastp.gz \
+        -S ${ID1%.fq.gz}.sam
+    # SAM -> BAM, sort, remove duplicates
+    samtools view -b -q 10 -o ${ID1%.fq.gz}.bam ${ID1%.fq.gz}.sam
+    samtools sort -O bam -o ${ID1%.fq.gz}.sort.bam -T tmp ${ID1%.fq.gz}.bam
+    java -Xmx20g -jar $PICARD MarkDuplicates \
+        INPUT=${ID1%.fq.gz}.sort.bam \
+        OUTPUT=${ID1%.fq.gz}.clean.bam \
+        METRICS_FILE=${ID1%.fq.gz}.metrics.txt \
+        REMOVE_DUPLICATES=true \
+        VALIDATION_STRINGENCY=LENIENT
+    # BAM -> BED
+    bedtools bamtobed -i ${ID1%.fq.gz}.clean.bam > ${ID1%.fq.gz}.bed
+    # Generate BigWig
+    python3 $BIGWIG_SCRIPT -p=$THREADS -sort $GENOME_SIZES ${ID1%.fq.gz}.bed
+    # Peak calling with MACS2 (ATAC-seq parameters)
+    macs2 callpeak -t ${ID1%.fq.gz}.bed \
+        -n 1_${ID1%.fq.gz} \
+        -g $GENOME_SIZE_GB \
+        --extsize 200 --shift -100 \
+        --keep-dup all --nomodel --nolambda --call-summits \
+        --outdir ./call_peak
+done
+# =========================================
+# 4. ChIP-seq: Merge, overlap, filter peaks
+# =========================================
+# Example: overlap peaks from two replicates
+bedtools intersect -a D-rep1_peaks.narrowPeak -b D-rep2_peaks.narrowPeak \
+    | bedtools sort -i - | bedtools merge -i - -d 150 | awk '$3-$2>200' > 2-D-ChIP_overlap.bed
+# Remove peaks overlapping with input
+bedtools subtract -a 2-D-ChIP_overlap.bed -b input_peaks_merge.bed > 2-D_cut-Peak.bed
+# Merge peaks from all samples
+cat D-rep2_cut-Peak.bed H-rep2_cut-Peak.bed T-rep2_cut-Peak.bed \
+    | bedtools sort -i - | bedtools merge -i - > DHT-all-ChIP.pks.bed
+# =========================================
+# 5. ChIP-seq: Generate DESeq2 count matrix
+# =========================================
+# Create bins for counting
+bedtools makewindows -b DHT-all-ChIP.pks.bed -w 200 -s 50 > bins.bed
+# Compute normalized coverage and convert to BigWig
+for sample in D-rep1 D-rep2 H-rep1 H-rep2 T-rep1 T-rep2; do
+    bedtools genomecov -i ${sample}.bed -bg -g $GENOME_SIZES > ${sample}.bg
+    x=$(bedtools intersect -b DHT-all-ChIP.pks.bed -a ${sample}.bed -wa | wc -l)
+    awk -v total=$x '{print $1,$2,$3,$4/total*1000000}' OFS="\t" ${sample}.bg > ${sample}.norm.bgx
+    wigToBigWig ${sample}.norm.bgx $GENOME_SIZES ${sample}.norm.bw
+done
+# Map normalized coverage to bins
+for sample in D-rep1 D-rep2 H-rep1 H-rep2 T-rep1 T-rep2; do
+    bedtools map -a bins.bed -b ${sample}.norm.bgx -c 4 -o sum > ${sample}.counts
+done
+# Merge counts into one DESeq2-compatible matrix
+paste bins.bed D-rep1.counts D-rep2.counts H-rep1.counts H-rep2.counts T-rep1.counts T-rep2.counts > bins.ChIP.counts
