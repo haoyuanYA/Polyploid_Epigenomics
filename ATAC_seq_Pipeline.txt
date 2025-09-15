@@ -1,0 +1,142 @@
+# -----------------------------
+# User-configurable variables
+# -----------------------------
+GENOME_DIR="/lustre4/gulab/dhy/1.genome/finall_o_gap_genome/baicai"
+PICARD="/path/to/picard.jar"
+BIGWIG="/path/to/bed2bigwig.py"   # Python script to generate BigWig files
+THREADS=10
+CHROM_SIZE="/home/data1/wzf/dhy/baicai_genome/baicai.nogap.fina.chrom_size"
+GENOME_SIZE_GB="4.23e8"           # Genome size for MACS2
+INPUT_LIST="list"                 # Tab-delimited file: ID1 ID2 (paired-end files)
+
+OUTPUT_DIR="./results"
+mkdir -p ${OUTPUT_DIR}
+
+# -----------------------------
+# Main processing loop for each paired-end sample
+# -----------------------------
+cat $INPUT_LIST | while read line; do
+    ID1=$(echo $line | awk '{print $1}')
+    ID2=$(echo $line | awk '{print $2}')
+
+    echo "Processing sample pair: $ID1 $ID2"
+
+    # 1. Quality trimming
+    fastp -i ${ID1} -I ${ID2} \
+          -o ${OUTPUT_DIR}/${ID1%.fq.gz}.fastp.gz -O ${OUTPUT_DIR}/${ID2%.fq.gz}.fastp.gz \
+          -h ${OUTPUT_DIR}/${ID1%.fq.gz}.fastp.html \
+          -w ${THREADS}
+
+    # 2. Alignment with Bowtie2
+    bowtie2 -x ${GENOME_DIR}.index -p ${THREADS} -X 1000 \
+            -1 ${OUTPUT_DIR}/${ID1%.fq.gz}.fastp.gz -2 ${OUTPUT_DIR}/${ID2%.fq.gz}.fastp.gz \
+            -S ${OUTPUT_DIR}/${ID1%.fq.gz}.sam --very-sensitive
+
+    # 3. Convert SAM -> BAM, filter by MAPQ, and sort
+    samtools view -b -q 10 -o ${OUTPUT_DIR}/${ID1%.fq.gz}.bam ${OUTPUT_DIR}/${ID1%.fq.gz}.sam
+    samtools sort -O bam -o ${OUTPUT_DIR}/${ID1%.fq.gz}.sort.bam -T tmp ${OUTPUT_DIR}/${ID1%.fq.gz}.bam
+
+    # 4. Mark duplicates
+    java -Xmx20g -jar ${PICARD} MarkDuplicates \
+         INPUT=${OUTPUT_DIR}/${ID1%.fq.gz}.sort.bam \
+         OUTPUT=${OUTPUT_DIR}/${ID1%.fq.gz}.clean.bam \
+         METRICS_FILE=${OUTPUT_DIR}/${ID1%.fq.gz}.metrics.txt \
+         REMOVE_DUPLICATES=true \
+         VALIDATION_STRINGENCY=LENIENT
+
+    # 5. Convert BAM -> BED
+    bedtools bamtobed -i ${OUTPUT_DIR}/${ID1%.fq.gz}.clean.bam > ${OUTPUT_DIR}/${ID1%.fq.gz}.bed
+
+    # 6. Generate BigWig coverage
+    python3 ${BIGWIG} -p=${THREADS} -sort ${CHROM_SIZE} ${OUTPUT_DIR}/${ID1%.fq.gz}.bed
+
+    # 7. Call peaks with MACS2
+    macs2 callpeak -t ${OUTPUT_DIR}/${ID1%.fq.gz}.bed \
+                   -n 1_${ID1%.fq.gz} \
+                   -g ${GENOME_SIZE_GB} \
+                   --extsize 200 \
+                   --shift -100 \
+                   --keep-dup all \
+                   --nomodel \
+                   --nolambda \
+                   --call-summits \
+                   --outdir ${OUTPUT_DIR}/call_peak
+done
+
+# -----------------------------
+# Post-processing narrowPeak files
+# -----------------------------
+echo "Filtering, sorting, and merging peaks..."
+
+# Filter narrowPeak: score>25 and length>200 bp
+for i in ${OUTPUT_DIR}/*narrowPeak; do
+    awk -F'\t' '$5>25' "$i" | \
+    bedtools sort -i - | \
+    bedtools merge -i - | \
+    awk '$3-$2>200' > ${OUTPUT_DIR}/2-$(basename $i)
+done
+
+# Merge replicates (example: D, T, H groups)
+for rep in D T H; do
+    bedtools intersect -a ${OUTPUT_DIR}/2-${rep}-rep1.narrowPeak -b ${OUTPUT_DIR}/2-${rep}-rep2.narrowPeak | \
+    bedtools sort -i - | \
+    bedtools merge -i - | \
+    awk '$3-$2>200' > ${OUTPUT_DIR}/3-${rep}-peaks.bed
+done
+
+# Process input control
+awk -F'\t' '$5>15' input_baicai3-peak_peaks.narrowPeak | \
+bedtools sort -i - | \
+bedtools merge -i - > ${OUTPUT_DIR}/2-input_baicai3-peak_merge.bed
+
+# Subtract input to get final peaks
+for i in ${OUTPUT_DIR}/3-*.bed; do
+    bedtools subtract -a "$i" -b ${OUTPUT_DIR}/2-input_baicai3-peak_merge.bed > "${i}s"
+done
+
+# -----------------------------
+# Tn5 insertion site normalization and count matrix
+# -----------------------------
+echo "Generating Tn5 insertion sites, coverage, and count matrices..."
+
+# Merge all sample peaks for counting
+cat ${OUTPUT_DIR}/*.bed | bedtools sort -i - | bedtools merge -i - > ${OUTPUT_DIR}/all.pks.bed
+
+# Process each BED file for Tn5 insertions
+for BED_FILE in ${OUTPUT_DIR}/*.bed; do
+    # Shift reads for Tn5
+    awk 'BEGIN{OFS="\t"} {if($6=="+") print $1,$2+4,$2+5; else print $1,$3-6,$3-5}' $BED_FILE > ${BED_FILE}.Tn5
+    # Extend Tn5 sites
+    awk '{if($2<75) print $1,"0",$3+74; else print $1,$2-75,$3+74}' OFS="\t" ${BED_FILE}.Tn5 > ${BED_FILE}.Tn5.ex
+    # BedGraph coverage
+    bedtools genomecov -i ${BED_FILE}.Tn5.ex -split -bg -g $CHROM_SIZE > ${BED_FILE}.Tn5ex.bg
+    # BigWig conversion
+    wigToBigWig ${BED_FILE}.Tn5ex.bg $CHROM_SIZE ${BED_FILE}.Tn5ex.bw
+    # Count overlaps with merged peaks
+    TOTAL_OVERLAPS=$(bedtools intersect -a ${BED_FILE}.Tn5 -b ${OUTPUT_DIR}/all.pks.bed -wa | wc -l)
+    echo "${BED_FILE}: $TOTAL_OVERLAPS overlaps"
+    # Normalize coverage
+    awk -v total=$TOTAL_OVERLAPS '{print $1,$2,$3,$4/total*1000000}' OFS="\t" ${BED_FILE}.Tn5ex.bg > ${BED_FILE}.bgx
+    wigToBigWig ${BED_FILE}.bgx $CHROM_SIZE ${BED_FILE}.result.bw
+done
+
+# Create genomic windows
+bedtools makewindows -b ${OUTPUT_DIR}/all.pks.bed -w 200 -s 50 > ${OUTPUT_DIR}/bins.bed
+
+# Compute coverage counts for each normalized BigWig
+for BGX_FILE in ${OUTPUT_DIR}/*.bgx; do
+    bedtools coverage -a ${OUTPUT_DIR}/bins.bed -b ${BGX_FILE} -counts > ${BGX_FILE}.counts
+    cut -f4 ${BGX_FILE}.counts > ${BGX_FILE}.counts2
+done
+
+# Combine counts into matrix (example header)
+printf "chr\tstart\tend\tbin\tH-rep1\tH-rep2\tD-rep1\tD-rep2\tT-rep1\tT-rep2\n" > ${OUTPUT_DIR}/ATAC-bins.counts
+paste ${OUTPUT_DIR}/H-rep1_baicai3.clean.bam.Tn5.bgx.counts2 \
+      ${OUTPUT_DIR}/H-rep2_baicai3.clean.bam.Tn5.bgx.counts2 \
+      ${OUTPUT_DIR}/D-rep1_baicai3.clean.bam.Tn5.bgx.counts2 \
+      ${OUTPUT_DIR}/D-rep2_baicai3.clean.bam.Tn5.bgx.counts2 \
+      ${OUTPUT_DIR}/T-rep1_baicai3.clean.bam.Tn5.bgx.counts2 \
+      ${OUTPUT_DIR}/T-rep2_baicai3.clean.bam.Tn5.bgx.counts2 \
+>> ${OUTPUT_DIR}/ATAC-bins.counts
+
+echo "ATAC-seq processing pipeline complete!"
