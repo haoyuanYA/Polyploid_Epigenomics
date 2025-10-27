@@ -1,4 +1,3 @@
-
 # ----------------------------- #
 #   Function: Process one sample #
 # ----------------------------- #
@@ -77,3 +76,4 @@ featureCounts \
     "${OUTPUT_DIR}"/*.Q10.bam
 
 echo ">>> RNA-seq processing pipeline complete."
+
