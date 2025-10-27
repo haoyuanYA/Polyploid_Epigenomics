@@ -1,18 +1,4 @@
 # -----------------------------
-# User-configurable variables
-# -----------------------------
-GENOME_DIR="/lustre4/gulab/dhy/1.genome/finall_o_gap_genome/baicai"
-PICARD="/path/to/picard.jar"
-BIGWIG="/path/to/bed2bigwig.py"   # Python script to generate BigWig files
-THREADS=10
-CHROM_SIZE="/home/data1/wzf/dhy/baicai_genome/baicai.nogap.fina.chrom_size"
-GENOME_SIZE_GB="4.23e8"           # Genome size for MACS2
-INPUT_LIST="list"                 # Tab-delimited file: ID1 ID2 (paired-end files)
-
-OUTPUT_DIR="./results"
-mkdir -p ${OUTPUT_DIR}
-
-# -----------------------------
 # Main processing loop for each paired-end sample
 # -----------------------------
 cat $INPUT_LIST | while read line; do
@@ -140,3 +126,4 @@ paste ${OUTPUT_DIR}/H-rep1_baicai3.clean.bam.Tn5.bgx.counts2 \
 >> ${OUTPUT_DIR}/ATAC-bins.counts
 
 echo "ATAC-seq processing pipeline complete!"
+
